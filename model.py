@@ -4,8 +4,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_auc_score
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization
+from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization, LeakyReLU
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras import regularizers
@@ -426,25 +425,48 @@ elif X_train_val_final.shape[1] == 0 and len(X_train_val_final) == 0:
 print("\n--- 6. Building and Training Neural Network (Wider First Layer, Tunable Params) ---")
 
 def create_nn_model(input_shape, num_classes_out, l2_lambda_val):
-    model = Sequential([
-        Input(shape=(input_shape,)),
-        Dense(1024, activation='relu', kernel_initializer='he_normal', kernel_regularizer=regularizers.l2(l2_lambda_val)), # Wider first layer
-        BatchNormalization(),
-        Dropout(0.5), 
-        Dense(512, activation='relu', kernel_initializer='he_normal', kernel_regularizer=regularizers.l2(l2_lambda_val)),
-        BatchNormalization(),
-        Dropout(0.4),
-        Dense(256, activation='relu', kernel_initializer='he_normal', kernel_regularizer=regularizers.l2(l2_lambda_val)),
-        BatchNormalization(),
-        Dropout(0.3),
-        Dense(128, activation='relu', kernel_initializer='he_normal', kernel_regularizer=regularizers.l2(l2_lambda_val)), 
-        BatchNormalization(),
-        Dropout(0.2),                                                
-        Dense(num_classes_out, activation='softmax')
-    ])
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=INITIAL_LR), 
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy', tf.keras.metrics.AUC(name='auc_keras', multi_label=True, num_labels=num_classes_out)])
+    """Builds an improved feed-forward network for tabular data."""
+    inputs = Input(shape=(input_shape,))
+
+    x = Dense(1024, kernel_initializer="he_normal",
+              kernel_regularizer=regularizers.l2(l2_lambda_val))(inputs)
+    x = BatchNormalization()(x)
+    x = LeakyReLU()(x)
+    x = Dropout(0.5)(x)
+
+    x = Dense(512, kernel_initializer="he_normal",
+              kernel_regularizer=regularizers.l2(l2_lambda_val))(x)
+    x = BatchNormalization()(x)
+    x = LeakyReLU()(x)
+    x = Dropout(0.4)(x)
+
+    x = Dense(256, kernel_initializer="he_normal",
+              kernel_regularizer=regularizers.l2(l2_lambda_val))(x)
+    x = BatchNormalization()(x)
+    x = LeakyReLU()(x)
+    x = Dropout(0.3)(x)
+
+    x = Dense(128, kernel_initializer="he_normal",
+              kernel_regularizer=regularizers.l2(l2_lambda_val))(x)
+    x = BatchNormalization()(x)
+    x = LeakyReLU()(x)
+    x = Dropout(0.2)(x)
+
+    outputs = Dense(num_classes_out, activation="softmax")(x)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.AdamW(
+            learning_rate=INITIAL_LR, weight_decay=l2_lambda_val
+        ),
+        loss="categorical_crossentropy",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(
+                name="auc_keras", multi_label=True, num_labels=num_classes_out
+            ),
+        ],
+    )
     return model
 
 if X_train_val_final.shape[1] > 0: 
