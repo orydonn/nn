@@ -16,15 +16,14 @@ logger = logging.getLogger(__name__)
 # --- Hyperparameters & Configuration ---
 import argparse
 
-def parse_args(args=None):
-    """Parse command-line arguments, ignoring unknown ones in interactive use."""
+def parse_args():
+
     parser = argparse.ArgumentParser(description="Train neural network model")
     parser.add_argument("--l2", type=float, default=L2_REG_LAMBDA, help="L2 regularization")
     parser.add_argument("--lr", type=float, default=INITIAL_LR, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help="Number of epochs")
-    parsed_args, _ = parser.parse_known_args(args=args)
-    return parsed_args
+    return parser.parse_args()
 L2_REG_LAMBDA = 0.0001  # L2 Regularization strength (tune this: e.g., 0.00005, 0.0005, 0.001)
 INITIAL_LR = 0.001    # Initial Learning Rate (tune this: e.g., 0.0005, 0.002)
 BATCH_SIZE = 256      # Batch size (tune this: e.g., 128, 512)

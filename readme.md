@@ -20,6 +20,3 @@ Run the training script with optional hyperparameters:
 python model.py --l2 0.0001 --lr 0.001 --batch-size 256 --epochs 150
 ```
 This will produce a submission CSV with probabilities for each cluster.
-If you call `model.py` from a Jupyter notebook, any additional arguments
-supplied by the kernel (such as `-f <connection_file>`) will be ignored
-thanks to the argument parser using `parse_known_args`.
