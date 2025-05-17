@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 import argparse
 
 def parse_args():
+
     parser = argparse.ArgumentParser(description="Train neural network model")
     parser.add_argument("--l2", type=float, default=L2_REG_LAMBDA, help="L2 regularization")
     parser.add_argument("--lr", type=float, default=INITIAL_LR, help="Learning rate")
