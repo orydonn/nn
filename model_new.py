@@ -83,18 +83,46 @@ def main():
     X = train_proc.values
     y = train_df['target'].values
 
-    kf = KFold(n_splits=3, shuffle=False)
+    # Use shuffled KFold to reduce variance between folds
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
     oof_preds = np.zeros((len(train_df), len(le.classes_)))
     fold_scores = []
+    best_iterations = []
+
+    params = dict(
+        objective='multiclass',
+        boosting_type='gbdt',
+        num_class=len(le.classes_),
+        learning_rate=0.05,
+        num_leaves=63,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_estimators=1000,
+    )
+
+    # Precompute sample weights to better match the evaluation metric
+    train_weights = train_df['end_cluster'].astype(str).map(cluster_weights).fillna(1.0).values
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X)):
         logger.info(f'Starting fold {fold + 1}')
         print(f'Fold {fold + 1} training...')
-        model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
-        model.fit(X[tr_idx], y[tr_idx])
-        preds = model.predict_proba(X[val_idx])
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X[tr_idx],
+            y[tr_idx],
+            sample_weight=train_weights[tr_idx],
+            eval_set=[(X[val_idx], y[val_idx])],
+            eval_sample_weight=[train_weights[val_idx]],
+            eval_metric='multi_logloss',
+            early_stopping_rounds=50,
+            verbose=False,
+        )
+        best_iter = model.best_iteration_ or params['n_estimators']
+        best_iterations.append(best_iter)
+        preds = model.predict_proba(X[val_idx], num_iteration=best_iter)
         score = weighted_roc_auc(y[val_idx], preds, cluster_weights, le)
-        logger.info(f'Fold {fold + 1} weighted AUC: {score:.4f}')
+        logger.info(f'Fold {fold + 1} weighted AUC: {score:.4f} at iter {best_iter}')
         print(f'Fold {fold + 1} AUC: {score:.4f}')
         oof_preds[val_idx] = preds
         fold_scores.append(score)
@@ -104,14 +132,15 @@ def main():
 
     logger.info('Training final model...')
     print('Training final model...')
-    final_model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
-    final_model.fit(X, y)
+    avg_best_iter = int(np.mean(best_iterations)) if best_iterations else params['n_estimators']
+    final_model = lgb.LGBMClassifier(**params, n_estimators=avg_best_iter)
+    final_model.fit(X, y, sample_weight=train_weights)
 
     test_features = test_proc[test_df['date'] == 'month_6'].values
     ids = test_df.loc[test_df['date'] == 'month_6', 'id']
     logger.info(f'Predicting on {len(ids)} test rows...')
     print(f'Predicting on {len(ids)} rows...')
-    test_pred = final_model.predict_proba(test_features)
+    test_pred = final_model.predict_proba(test_features, num_iteration=avg_best_iter)
 
     submission = pd.DataFrame(test_pred, columns=le.classes_)
     submission.insert(0, 'id', ids.values)
