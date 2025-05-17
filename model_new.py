@@ -10,31 +10,14 @@ except OSError as e:
     ) from e
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_auc_score
+
+from utils import weighted_roc_auc
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 MAX_OHE_CATEGORIES = 20
-
-
-def weighted_roc_auc(y_true, y_pred_proba, weights_dict, le):
-    """Compute weighted one-vs-all ROC AUC"""
-    if len(y_true) == 0:
-        return 0.0
-    labels = np.unique(y_true)
-    try:
-        aucs = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average=None, labels=labels)
-    except ValueError:
-        return 0.0
-    labels_str = le.inverse_transform(labels)
-    weights = np.array([weights_dict.get(str(lbl), 0) for lbl in labels_str], dtype=float)
-    if weights.sum() == 0:
-        weights = np.ones_like(weights) / len(weights)
-    else:
-        weights /= weights.sum()
-    return float(np.sum(aucs * weights))
 
 
 def load_feature_lists(path='feature_description.xlsx'):
