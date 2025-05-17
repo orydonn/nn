@@ -1,125 +1,118 @@
 import pandas as pd
 import numpy as np
-import argparse
-import logging
+import lightgbm as lgb
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_auc_score
-import lightgbm as lgb
+import logging
 
-MAX_OHE_CATEGORIES = 30
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_feature_lists(path: str):
-    df = pd.read_excel(path)
-    num_cols = df[df['Тип'] == 'number']['Признак'].tolist()
-    cat_cols = df[df['Тип'] == 'category']['Признак'].tolist()
+MAX_OHE_CATEGORIES = 20
+
+
+def weighted_roc_auc(y_true, y_pred_proba, weights_dict, le):
+    """Compute weighted one-vs-all ROC AUC"""
+    if len(y_true) == 0:
+        return 0.0
+    labels = np.unique(y_true)
+    try:
+        aucs = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average=None, labels=labels)
+    except ValueError:
+        return 0.0
+    labels_str = le.inverse_transform(labels)
+    weights = np.array([weights_dict.get(str(lbl), 0) for lbl in labels_str], dtype=float)
+    if weights.sum() == 0:
+        weights = np.ones_like(weights) / len(weights)
+    else:
+        weights /= weights.sum()
+    return float(np.sum(aucs * weights))
+
+
+def load_feature_lists(path='feature_description.xlsx'):
+    desc = pd.read_excel(path)
+    num_cols = desc[desc['Тип'] == 'number']['Признак'].tolist()
+    cat_cols = desc[desc['Тип'] == 'category']['Признак'].tolist()
     return num_cols, cat_cols
 
-def load_cluster_weights(path: str):
-    df = pd.read_excel(path)
-    return dict(zip(df['cluster'].astype(str), df['unnorm_weight']))
 
-def load_data():
-    train = pd.read_parquet('train_data.pqt')
-    test = pd.read_parquet('test_data.pqt')
-    return train, test
-
-def parse_months(df: pd.DataFrame) -> pd.DataFrame:
-    df['month_num'] = df['date'].str.replace('month_', '').astype(int)
+def cap_rare_categories(df, cat_cols):
+    for col in cat_cols:
+        vc = df[col].value_counts()
+        rare = vc[vc < MAX_OHE_CATEGORIES].index
+        df[col] = df[col].where(~df[col].isin(rare), '__OTHER__')
     return df
 
-def impute_start_cluster(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    mode = train['start_cluster'].mode()
-    fill_val = mode.iloc[0] if not mode.empty else 'unknown'
-    pivot = test.pivot_table(index='id', columns='month_num', values='start_cluster', aggfunc='first')
-    idx = test['month_num'] == 6
-    if idx.any():
-        ids = test.loc[idx, 'id']
-        val = pivot.reindex(ids).get(5)
-        fallback = pivot.reindex(ids).get(4)
-        val = val.fillna(fallback).fillna(fill_val)
-        test.loc[idx, 'start_cluster'] = val.values
-    return train, test
 
-def cap_categories(train: pd.DataFrame, test: pd.DataFrame, cat_cols: list[str]):
-    for col in cat_cols:
-        counts = train[col].astype(str).value_counts()
-        rare = counts[counts < MAX_OHE_CATEGORIES].index
-        train[col] = train[col].astype(str).apply(lambda x: x if x not in rare else '__OTHER__')
-        test[col] = test[col].astype(str).apply(lambda x: x if x not in rare else '__OTHER__')
-    return train, test
+def preprocess(train_df, test_df, num_cols, cat_cols):
+    full = pd.concat([train_df, test_df], keys=['train', 'test'])
+    full = cap_rare_categories(full, cat_cols)
+    full = pd.get_dummies(full, columns=cat_cols, dummy_na=False)
+    train_proc = full.xs('train')
+    test_proc = full.xs('test')
+    return train_proc, test_proc
 
-def prepare_full_dataframe(num_cols, cat_cols):
-    train, test = load_data()
-    train = parse_months(train)
-    test = parse_months(test)
-    train, test = impute_start_cluster(train, test)
-    cat_cols_full = list(cat_cols) + ['start_cluster']
-    train, test = cap_categories(train, test, cat_cols_full)
-    train['is_train'] = 1
-    test['is_train'] = 0
-    full = pd.concat([train, test], ignore_index=True)
-    # ensure types
-    full[num_cols] = full[num_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-    for col in cat_cols_full:
-        full[col] = full[col].astype(str)
-    full = pd.get_dummies(full, columns=cat_cols_full, dummy_na=False)
-    return full
-
-def weighted_roc_auc(y_true: np.ndarray, y_pred: np.ndarray, weights: dict, le: LabelEncoder) -> float:
-    labels = np.unique(y_true)
-    if labels.size == 0:
-        return 0.0
-    aucs = roc_auc_score(y_true, y_pred, multi_class='ovr', average=None, labels=labels)
-    labels_str = le.inverse_transform(labels)
-    w = np.array([weights.get(str(l), 0) for l in labels_str], dtype=float)
-    if w.sum() == 0:
-        w = np.ones_like(w) / len(w)
-    else:
-        w = w / w.sum()
-    m = min(len(aucs), len(w))
-    return float(np.sum(aucs[:m] * w[:m]))
-
-def train_lightgbm_cv(full_df: pd.DataFrame, weights: dict, n_estimators: int = 200):
-    train_df = full_df[full_df['is_train'] == 1].copy()
-    test_df = full_df[(full_df['is_train'] == 0) & (full_df['month_num'] == 6)].copy()
-    le = LabelEncoder()
-    y = le.fit_transform(train_df['end_cluster'].astype(str))
-    X = train_df.drop(columns=['id', 'date', 'end_cluster', 'is_train'])
-    X_test = test_df.drop(columns=['id', 'date', 'end_cluster', 'is_train'])
-    ids_test = test_df['id'].values
-    months = sorted(train_df['month_num'].unique())
-    num_classes = len(le.classes_)
-    preds_test = np.zeros((len(ids_test), num_classes))
-    scores = []
-    for val_month in months:
-        train_idx = train_df['month_num'] != val_month
-        val_idx = train_df['month_num'] == val_month
-        gbm = lgb.LGBMClassifier(objective='multiclass', num_class=num_classes,
-                                 n_estimators=n_estimators, random_state=42, n_jobs=-1)
-        gbm.fit(X.iloc[train_idx], y[train_idx], eval_set=[(X.iloc[val_idx], y[val_idx])], verbose=False)
-        val_pred = gbm.predict_proba(X.iloc[val_idx])
-        score = weighted_roc_auc(y[val_idx], val_pred, weights, le)
-        scores.append(score)
-        preds_test += gbm.predict_proba(X_test) / len(months)
-    return preds_test, ids_test, float(np.mean(scores)), le
 
 def main():
-    parser = argparse.ArgumentParser(description='Train LightGBM model with cross-validation')
-    parser.add_argument('--n-estimators', type=int, default=200)
-    parser.add_argument('--output', type=str, default='submission.csv')
-    args, _ = parser.parse_known_args()
+    logger.info('Loading data...')
+    print('Loading data...')
+    train_df = pd.read_parquet('train_data.pqt')
+    test_df = pd.read_parquet('test_data.pqt')
+    cluster_weights = pd.read_excel('cluster_weights.xlsx').set_index('cluster')['unnorm_weight'].to_dict()
+    submission_template = pd.read_csv('sample_submission.csv')
 
-    num_cols, cat_cols = load_feature_lists('feature_description.xlsx')
-    weights = load_cluster_weights('cluster_weights.xlsx')
-    full_df = prepare_full_dataframe(num_cols, cat_cols)
-    preds, ids, score, le = train_lightgbm_cv(full_df, weights, n_estimators=args.n_estimators)
-    logger.info('Mean CV weighted ROC-AUC: %s', score)
-    submission = pd.DataFrame(preds, columns=le.classes_)
-    submission.insert(0, 'id', ids)
-    submission.to_csv(args.output, index=False)
-    logger.info('Saved predictions to %s', args.output)
+    num_cols, cat_cols = load_feature_lists()
+    logger.info(f'Numeric features: {len(num_cols)}, Categorical features: {len(cat_cols)}')
+    print(f'Parsed feature lists. Numeric: {len(num_cols)}; Categorical: {len(cat_cols)}')
+
+    le = LabelEncoder()
+    le.fit(train_df['end_cluster'].astype(str))
+    train_df['target'] = le.transform(train_df['end_cluster'].astype(str))
+
+    train_proc, test_proc = preprocess(train_df[num_cols + cat_cols], test_df[num_cols + cat_cols], num_cols, cat_cols)
+    print('Preprocessing finished.')
+
+    X = train_proc.values
+    y = train_df['target'].values
+
+    kf = KFold(n_splits=3, shuffle=False)
+    oof_preds = np.zeros((len(train_df), len(le.classes_)))
+    fold_scores = []
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X)):
+        logger.info(f'Starting fold {fold + 1}')
+        print(f'Fold {fold + 1} training...')
+        model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
+        model.fit(X[tr_idx], y[tr_idx])
+        preds = model.predict_proba(X[val_idx])
+        score = weighted_roc_auc(y[val_idx], preds, cluster_weights, le)
+        logger.info(f'Fold {fold + 1} weighted AUC: {score:.4f}')
+        print(f'Fold {fold + 1} AUC: {score:.4f}')
+        oof_preds[val_idx] = preds
+        fold_scores.append(score)
+
+    logger.info(f'Mean CV weighted AUC: {np.mean(fold_scores):.4f}')
+    print(f'CV done. Mean AUC: {np.mean(fold_scores):.4f}')
+
+    logger.info('Training final model...')
+    print('Training final model...')
+    final_model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
+    final_model.fit(X, y)
+
+    test_features = test_proc[test_df['date'] == 'month_6'].values
+    ids = test_df.loc[test_df['date'] == 'month_6', 'id']
+    logger.info(f'Predicting on {len(ids)} test rows...')
+    print(f'Predicting on {len(ids)} rows...')
+    test_pred = final_model.predict_proba(test_features)
+
+    submission = pd.DataFrame(test_pred, columns=le.classes_)
+    submission.insert(0, 'id', ids.values)
+    submission = submission[submission_template.columns]
+    submission.to_csv('submission_lightgbm.csv', index=False)
+    logger.info('Submission saved to submission_lightgbm.csv')
+
+
 
 if __name__ == '__main__':
     main()
