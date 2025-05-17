@@ -1,6 +1,13 @@
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
+try:
+    import lightgbm as lgb
+except OSError as e:
+    raise RuntimeError(
+        "LightGBM library failed to load. On macOS this usually means the libomp\n"
+        "dependency is missing. Install it via 'brew install libomp' or reinstall\n"
+        "LightGBM with OpenMP support."
+    ) from e
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_auc_score
