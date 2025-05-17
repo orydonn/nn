@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import roc_auc_score
+
+from utils import weighted_roc_auc
 
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization, LeakyReLU
@@ -45,25 +46,7 @@ def load_data():
 
 
 # --- Utility: Weighted ROC AUC ---
-le_target = LabelEncoder() 
-
-def weighted_roc_auc(y_true_int: np.ndarray, y_pred_proba: np.ndarray, weights_dict: dict, label_encoder_for_target: LabelEncoder) -> float:
-    """Compute weighted one-vs-all ROC-AUC."""
-    present_labels = np.unique(y_true_int)
-    if present_labels.size == 0:
-        return 0.0
-    try:
-        aucs = roc_auc_score(y_true_int, y_pred_proba, multi_class="ovr", average=None, labels=present_labels)
-    except ValueError:
-        return 0.0
-    labels_str = label_encoder_for_target.inverse_transform(present_labels)
-    weights = np.array([weights_dict.get(str(lbl), 0) for lbl in labels_str])
-    if weights.sum() == 0:
-        weights = np.ones_like(weights, dtype=float) / len(weights)
-    else:
-        weights = weights / weights.sum()
-    min_len = min(len(aucs), len(weights))
-    return float(np.sum(aucs[:min_len] * weights[:min_len]))
+le_target = LabelEncoder()
 
 class WeightedRocAucEarlyStopping(tf.keras.callbacks.Callback):
     """Early stopping based on weighted ROC-AUC metric."""
