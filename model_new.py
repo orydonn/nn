@@ -52,12 +52,31 @@ def cap_rare_categories(df, cat_cols):
     return df
 
 
+def _add_numeric_features(full: pd.DataFrame, num_cols: list) -> pd.DataFrame:
+    """Add lag, diff and rolling statistics for numeric columns."""
+    # sort to ensure proper temporal ordering within each id
+    full = full.sort_values(['id', 'date'])
+    for col in num_cols:
+        if col not in full.columns:
+            continue
+        full[col] = pd.to_numeric(full[col], errors='coerce')
+        full[f"{col}_lag1"] = full.groupby('id')[col].shift(1)
+        full[f"{col}_diff1"] = full[col].fillna(0) - full[f"{col}_lag1"].fillna(0)
+        gb = full.groupby('id')[col]
+        full[f"{col}_roll_mean_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).mean())
+        full[f"{col}_roll_std_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).std())
+        for n in [f"{col}_lag1", f"{col}_diff1", f"{col}_roll_mean_2", f"{col}_roll_std_2"]:
+            full[n] = full[n].fillna(0)
+    return full
+
+
 def preprocess(train_df, test_df, num_cols, cat_cols):
     full = pd.concat([train_df, test_df], keys=['train', 'test'])
+    full = _add_numeric_features(full, num_cols)
     full = cap_rare_categories(full, cat_cols)
     full = pd.get_dummies(full, columns=cat_cols, dummy_na=False)
-    train_proc = full.xs('train')
-    test_proc = full.xs('test')
+    train_proc = full.xs('train').drop(['id', 'date'], axis=1)
+    test_proc = full.xs('test').drop(['id', 'date'], axis=1)
     return train_proc, test_proc
 
 
@@ -77,7 +96,12 @@ def main():
     le.fit(train_df['end_cluster'].astype(str))
     train_df['target'] = le.transform(train_df['end_cluster'].astype(str))
 
-    train_proc, test_proc = preprocess(train_df[num_cols + cat_cols], test_df[num_cols + cat_cols], num_cols, cat_cols)
+    train_proc, test_proc = preprocess(
+        train_df[['id', 'date'] + num_cols + cat_cols],
+        test_df[['id', 'date'] + num_cols + cat_cols],
+        num_cols,
+        cat_cols,
+    )
     print('Preprocessing finished.')
 
     X = train_proc.values
