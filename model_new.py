@@ -83,14 +83,32 @@ def impute_start_cluster(train_df: pd.DataFrame, test_df: pd.DataFrame):
         test_df.loc[idx_m6, 'start_cluster'] = val.values.astype(str)
 
     return train_df, test_df, dtype
+  
+def _add_numeric_features(full: pd.DataFrame, num_cols: list) -> pd.DataFrame:
+    """Add lag, diff and rolling statistics for numeric columns."""
+    # sort to ensure proper temporal ordering within each id
+    full = full.sort_values(['id', 'date'])
+    for col in num_cols:
+        if col not in full.columns:
+            continue
+        full[col] = pd.to_numeric(full[col], errors='coerce')
+        full[f"{col}_lag1"] = full.groupby('id')[col].shift(1)
+        full[f"{col}_diff1"] = full[col].fillna(0) - full[f"{col}_lag1"].fillna(0)
+        gb = full.groupby('id')[col]
+        full[f"{col}_roll_mean_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).mean())
+        full[f"{col}_roll_std_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).std())
+        for n in [f"{col}_lag1", f"{col}_diff1", f"{col}_roll_mean_2", f"{col}_roll_std_2"]:
+            full[n] = full[n].fillna(0)
+    return full
 
 
 def preprocess(train_df, test_df, num_cols, cat_cols):
     full = pd.concat([train_df, test_df], keys=['train', 'test'])
+    full = _add_numeric_features(full, num_cols)
     full = cap_rare_categories(full, cat_cols)
     full = pd.get_dummies(full, columns=cat_cols, dummy_na=False)
-    train_proc = full.xs('train')
-    test_proc = full.xs('test')
+    train_proc = full.xs('train').drop(['id', 'date'], axis=1)
+    test_proc = full.xs('test').drop(['id', 'date'], axis=1)
     return train_proc, test_proc
 
 
@@ -113,24 +131,57 @@ def main():
     le.fit(train_df['end_cluster'].astype(str))
     train_df['target'] = le.transform(train_df['end_cluster'].astype(str))
 
-    train_proc, test_proc = preprocess(train_df[num_cols + cat_cols], test_df[num_cols + cat_cols], num_cols, cat_cols)
+    train_proc, test_proc = preprocess(
+        train_df[['id', 'date'] + num_cols + cat_cols],
+        test_df[['id', 'date'] + num_cols + cat_cols],
+        num_cols,
+        cat_cols,
+    )
     print('Preprocessing finished.')
 
     X = train_proc.values
     y = train_df['target'].values
 
-    kf = KFold(n_splits=3, shuffle=False)
+    # Use shuffled KFold to reduce variance between folds
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
     oof_preds = np.zeros((len(train_df), len(le.classes_)))
     fold_scores = []
+    best_iterations = []
+
+    params = dict(
+        objective='multiclass',
+        boosting_type='gbdt',
+        num_class=len(le.classes_),
+        learning_rate=0.05,
+        num_leaves=63,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_estimators=1000,
+    )
+
+    # Precompute sample weights to better match the evaluation metric
+    train_weights = train_df['end_cluster'].astype(str).map(cluster_weights).fillna(1.0).values
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X)):
         logger.info(f'Starting fold {fold + 1}')
         print(f'Fold {fold + 1} training...')
-        model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
-        model.fit(X[tr_idx], y[tr_idx])
-        preds = model.predict_proba(X[val_idx])
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X[tr_idx],
+            y[tr_idx],
+            sample_weight=train_weights[tr_idx],
+            eval_set=[(X[val_idx], y[val_idx])],
+            eval_sample_weight=[train_weights[val_idx]],
+            eval_metric='multi_logloss',
+            early_stopping_rounds=50,
+            verbose=False,
+        )
+        best_iter = model.best_iteration_ or params['n_estimators']
+        best_iterations.append(best_iter)
+        preds = model.predict_proba(X[val_idx], num_iteration=best_iter)
         score = weighted_roc_auc(y[val_idx], preds, cluster_weights, le)
-        logger.info(f'Fold {fold + 1} weighted AUC: {score:.4f}')
+        logger.info(f'Fold {fold + 1} weighted AUC: {score:.4f} at iter {best_iter}')
         print(f'Fold {fold + 1} AUC: {score:.4f}')
         oof_preds[val_idx] = preds
         fold_scores.append(score)
@@ -140,14 +191,15 @@ def main():
 
     logger.info('Training final model...')
     print('Training final model...')
-    final_model = lgb.LGBMClassifier(n_estimators=300, random_state=42)
-    final_model.fit(X, y)
+    avg_best_iter = int(np.mean(best_iterations)) if best_iterations else params['n_estimators']
+    final_model = lgb.LGBMClassifier(**params, n_estimators=avg_best_iter)
+    final_model.fit(X, y, sample_weight=train_weights)
 
     test_features = test_proc[test_df['date'] == 'month_6'].values
     ids = test_df.loc[test_df['date'] == 'month_6', 'id']
     logger.info(f'Predicting on {len(ids)} test rows...')
     print(f'Predicting on {len(ids)} rows...')
-    test_pred = final_model.predict_proba(test_features)
+    test_pred = final_model.predict_proba(test_features, num_iteration=avg_best_iter)
 
     submission = pd.DataFrame(test_pred, columns=le.classes_)
     submission.insert(0, 'id', ids.values)
