@@ -14,6 +14,17 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 # --- Hyperparameters & Configuration ---
+import argparse
+
+def parse_args(args=None):
+    """Parse command-line arguments, ignoring unknown ones in interactive use."""
+    parser = argparse.ArgumentParser(description="Train neural network model")
+    parser.add_argument("--l2", type=float, default=L2_REG_LAMBDA, help="L2 regularization")
+    parser.add_argument("--lr", type=float, default=INITIAL_LR, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help="Number of epochs")
+    parsed_args, _ = parser.parse_known_args(args=args)
+    return parsed_args
 L2_REG_LAMBDA = 0.0001  # L2 Regularization strength (tune this: e.g., 0.00005, 0.0005, 0.001)
 INITIAL_LR = 0.001    # Initial Learning Rate (tune this: e.g., 0.0005, 0.002)
 BATCH_SIZE = 256      # Batch size (tune this: e.g., 128, 512)
@@ -39,42 +50,22 @@ def load_data():
 le_target = LabelEncoder() 
 
 def weighted_roc_auc(y_true_int: np.ndarray, y_pred_proba: np.ndarray, weights_dict: dict, label_encoder_for_target: LabelEncoder) -> float:
-    """Compute weighted ROC-AUC using class weights."""
-    actual_present_labels_int = np.unique(y_true_int)
-    try:
-        known_labels_mask = np.isin(actual_present_labels_int, label_encoder_for_target.transform(label_encoder_for_target.classes_))
-        actual_present_labels_int_known = actual_present_labels_int[known_labels_mask]
-        
-        if len(actual_present_labels_int_known) == 0:
-            return 0.0
-            
-        original_string_labels_present = label_encoder_for_target.inverse_transform(actual_present_labels_int_known)
-    except ValueError as e:
+    """Compute weighted one-vs-all ROC-AUC."""
+    present_labels = np.unique(y_true_int)
+    if present_labels.size == 0:
         return 0.0
-
-    unnorm_weights = np.array([weights_dict.get(str(label_str), 0) for label_str in original_string_labels_present])
-
-    if unnorm_weights.sum() == 0:
-        weights = np.ones_like(unnorm_weights) / len(unnorm_weights) if len(unnorm_weights) > 0 else []
+    try:
+        aucs = roc_auc_score(y_true_int, y_pred_proba, multi_class="ovr", average=None, labels=present_labels)
+    except ValueError:
+        return 0.0
+    labels_str = label_encoder_for_target.inverse_transform(present_labels)
+    weights = np.array([weights_dict.get(str(lbl), 0) for lbl in labels_str])
+    if weights.sum() == 0:
+        weights = np.ones_like(weights, dtype=float) / len(weights)
     else:
-        weights = unnorm_weights / unnorm_weights.sum()
-
-    if not len(weights) or len(actual_present_labels_int_known) == 0:
-        return 0.0
-    
-    try:
-        indices_for_present_labels = label_encoder_for_target.transform(original_string_labels_present)
-        if np.any(indices_for_present_labels >= y_pred_proba.shape[1]):
-            return 0.0
-        classes_roc_auc = roc_auc_score(y_true_int, y_pred_proba, multi_class='ovr', average=None, labels=actual_present_labels_int_known)
-    except ValueError as e:
-        return 0.0
-
-    if len(classes_roc_auc) != len(weights):
-        min_len = min(len(classes_roc_auc), len(weights))
-        return (classes_roc_auc[:min_len] * weights[:min_len]).sum() if min_len > 0 else 0.0
-
-    return (classes_roc_auc * weights).sum()
+        weights = weights / weights.sum()
+    min_len = min(len(aucs), len(weights))
+    return float(np.sum(aucs[:min_len] * weights[:min_len]))
 
 class WeightedRocAucEarlyStopping(tf.keras.callbacks.Callback):
     """Early stopping based on weighted ROC-AUC metric."""
@@ -110,366 +101,104 @@ class WeightedRocAucEarlyStopping(tf.keras.callbacks.Callback):
                 if self.best_weights is not None:
                     self.model.set_weights(self.best_weights)
 
-# --- 2. Preprocessing and Feature Engineering ---
+
+# --- Helper preprocessing functions ---
+
+def parse_month_numbers(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    """Convert textual month labels to integers."""
+    for df in (train_df, test_df):
+        df['month_num'] = df['date'].str.replace('month_', '').astype(int)
+    return train_df, test_df
+
+
+def impute_start_cluster(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    """Simple month_6 start_cluster imputation using previous months."""
+    all_cats = pd.concat([train_df['start_cluster'], test_df['start_cluster']]).dropna().astype(str).unique()
+    dtype = pd.CategoricalDtype(categories=all_cats, ordered=False)
+    train_df['start_cluster'] = train_df['start_cluster'].astype(str).astype(dtype)
+    test_df['start_cluster'] = test_df['start_cluster'].astype(str).astype(dtype)
+    mode_val = train_df['start_cluster'].mode()
+    mode_val = mode_val.iloc[0] if not mode_val.empty else (all_cats[0] if len(all_cats) else 'unknown')
+    pivot = test_df.pivot_table(index='id', columns='month_num', values='start_cluster', aggfunc='first')
+    idx_m6 = test_df[test_df['month_num'] == 6].index
+    if len(idx_m6) > 0:
+        ids = test_df.loc[idx_m6, 'id']
+        val = pivot.reindex(ids).get(5)
+        fallback = pivot.reindex(ids).get(4)
+        val = val.fillna(fallback).fillna(mode_val)
+        test_df.loc[idx_m6, 'start_cluster'] = val.values.astype(str)
+    return train_df, test_df, dtype
+
+
+def generate_features(full_df: pd.DataFrame, sc_dtype: pd.CategoricalDtype):
+    """Create basic lag and rolling features."""
+    cat_cols = ["channel_code", "city", "city_type", "okved", "segment", "start_cluster", "ogrn_month", "ogrn_year"]
+    num_cols = ["balance_amt_avg", "balance_amt_max", "balance_amt_min", "balance_amt_day_avg", "sum_cred_h_oper_3m", "sum_deb_h_oper_3m", "cnt_cred_h_oper_3m", "cnt_deb_h_oper_3m"]
+    final_cat = []
+    for col in cat_cols:
+        if col in full_df.columns:
+            full_df[col] = full_df[col].astype(str)
+            if col == "start_cluster":
+                full_df[col] = full_df[col].astype(sc_dtype)
+            final_cat.append(col)
+    for col in num_cols:
+        if col in full_df.columns:
+            full_df[col] = pd.to_numeric(full_df[col], errors='coerce')
+            full_df[f"{col}_lag1"] = full_df.groupby('id')[col].shift(1)
+            full_df[f"{col}_diff1"] = full_df[col].fillna(0) - full_df[f"{col}_lag1"].fillna(0)
+            gb = full_df.groupby('id')[col]
+            full_df[f"{col}_roll_mean_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).mean())
+            full_df[f"{col}_roll_std_2"] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).std())
+            for n in [f"{col}_lag1", f"{col}_diff1", f"{col}_roll_mean_2", f"{col}_roll_std_2"]:
+                full_df[n] = full_df[n].fillna(0)
+    full_df['prev_month_start_cluster'] = full_df.groupby('id')['start_cluster'].shift(1).astype(str).fillna('MISSING')
+    final_cat.append('prev_month_start_cluster')
+    return full_df, num_cols, final_cat
+
+
+def prepare_train_valid_test(full_df: pd.DataFrame, sc_dtype, train_df_orig: pd.DataFrame, sample_submission_df: pd.DataFrame):
+    """Prepare matrices for training/validation/test."""
+    train_df = full_df[full_df['is_train'] == 1].copy()
+    test_df = full_df[full_df['is_train'] == 0].copy()
+    le_target.fit(sorted(set(train_df_orig['end_cluster'].astype(str)) | set(sample_submission_df.columns[1:])))
+    num_classes = len(le_target.classes_)
+    train_df = train_df.merge(train_df_orig[['id', 'date', 'end_cluster']], on=['id', 'date'], how='left')
+    train_df.dropna(subset=['end_cluster'], inplace=True)
+    train_df['target'] = le_target.transform(train_df['end_cluster'].astype(str))
+    feature_cols = [c for c in full_df.columns if c not in ['id', 'date', 'month_num', 'is_train', 'end_cluster']]
+    X_train = train_df[train_df['month_num'].isin([1, 2])][feature_cols]
+    y_train = train_df[train_df['month_num'].isin([1, 2])]['target']
+    X_valid = train_df[train_df['month_num'] == 3][feature_cols]
+    y_valid = train_df[train_df['month_num'] == 3]['target']
+    X_test = test_df[test_df['month_num'] == 6][feature_cols]
+    ids_test = test_df[test_df['month_num'] == 6]['id']
+    scaler = StandardScaler()
+    X_train_num = scaler.fit_transform(X_train.select_dtypes(include=[np.number]).fillna(0))
+    X_valid_num = scaler.transform(X_valid.select_dtypes(include=[np.number]).fillna(0))
+    X_test_num = scaler.transform(X_test.select_dtypes(include=[np.number]).fillna(0)) if not X_test.empty else np.empty((0, X_train_num.shape[1]))
+    cat_cols = [c for c in feature_cols if c in full_df.columns and (full_df[c].dtype == object or isinstance(full_df[c].dtype, pd.CategoricalDtype))]
+    X_train_cat = pd.get_dummies(X_train[cat_cols].astype(str), dummy_na=False)
+    X_valid_cat = pd.get_dummies(X_valid[cat_cols].astype(str), dummy_na=False)
+    X_test_cat = pd.get_dummies(X_test[cat_cols].astype(str), dummy_na=False)
+    X_valid_cat = X_valid_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+    X_test_cat = X_test_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+    X_train_final = np.hstack([X_train_num, X_train_cat.values])
+    X_valid_final = np.hstack([X_valid_num, X_valid_cat.values])
+    X_test_final = np.hstack([X_test_num, X_test_cat.values])
+    y_train_ohe = to_categorical(y_train, num_classes=num_classes)
+    y_valid_ohe = to_categorical(y_valid, num_classes=num_classes)
+    return (X_train_final, y_train, y_train_ohe, X_valid_final, y_valid, y_valid_ohe, X_test_final, ids_test, num_classes)
+
+
 def preprocess_data(train_df_orig_loaded, test_df_orig_loaded, cluster_weights_df, sample_submission_df):
     logger.info("\n--- 2. Starting preprocessing and feature engineering... ---")
-    
-    def date_to_numeric(df_to_process):
-        df_copy = df_to_process.copy()
-        df_copy['month_num'] = df_copy['date'].str.replace('month_', '').astype(int)
-        return df_copy
-    
-    train_df = date_to_numeric(train_df_orig_loaded)
-    test_df = date_to_numeric(test_df_orig_loaded)
-    
-    # --- 2.1. Advanced start_cluster imputation for month_6 (Same as before) ---
-    # ... (This section is kept identical to the previous working version) ...
-    logger.info("Calculating start_cluster transition matrix for month_6 imputation...")
-    all_original_start_clusters = pd.concat([train_df['start_cluster'], test_df['start_cluster']]).dropna().unique()
-    all_original_start_clusters_str = [str(cat) for cat in all_original_start_clusters]
-    start_cluster_dtype = pd.CategoricalDtype(categories=all_original_start_clusters_str, ordered=False)
-    
-    train_df['start_cluster'] = train_df['start_cluster'].astype(str).astype(start_cluster_dtype)
-    test_df['start_cluster'] = test_df['start_cluster'].astype(str).astype(start_cluster_dtype)
-    
-    transition_data_frames = []
-    train_df_sorted = train_df.sort_values(['id', 'month_num'])
-    train_df_sorted['next_month_start_cluster'] = train_df_sorted.groupby('id')['start_cluster'].shift(-1)
-    train_transitions = train_df_sorted.dropna(subset=['start_cluster', 'next_month_start_cluster'])
-    if not train_transitions.empty:
-        transition_data_frames.append(train_transitions[['start_cluster', 'next_month_start_cluster']])
-    
-    test_df_m4_m5 = test_df[test_df['month_num'].isin([4, 5])].copy()
-    test_df_m4_m5_sorted = test_df_m4_m5.sort_values(['id', 'month_num'])
-    test_df_m4_m5_sorted['start_cluster'] = test_df_m4_m5_sorted['start_cluster'].astype(start_cluster_dtype)
-    test_df_m4_m5_sorted['next_month_start_cluster'] = test_df_m4_m5_sorted.groupby('id')['start_cluster'].shift(-1)
-    test_transitions_m4_m5 = test_df_m4_m5_sorted[test_df_m4_m5_sorted['month_num'] == 4]
-    test_transitions_m4_m5 = test_transitions_m4_m5.dropna(subset=['start_cluster', 'next_month_start_cluster'])
-    if not test_transitions_m4_m5.empty:
-        transition_data_frames.append(test_transitions_m4_m5[['start_cluster', 'next_month_start_cluster']])
-    
-    train_start_cluster_mode = train_df['start_cluster'].mode()
-    train_start_cluster_mode = train_start_cluster_mode[0] if not train_start_cluster_mode.empty else None
-    if train_start_cluster_mode is None and len(all_original_start_clusters_str) > 0:
-        train_start_cluster_mode = all_original_start_clusters_str[0]
-    elif train_start_cluster_mode is None:
-        train_start_cluster_mode = "other_fallback_mode" 
-        logger.warning(f"Warning: train_start_cluster_mode is None. Using '{train_start_cluster_mode}'.")
-        if train_start_cluster_mode not in start_cluster_dtype.categories:
-            new_categories = list(start_cluster_dtype.categories) + [train_start_cluster_mode]
-            start_cluster_dtype = pd.CategoricalDtype(categories=new_categories, ordered=False)
-            train_df['start_cluster'] = train_df['start_cluster'].astype(str).astype(start_cluster_dtype)
-            test_df['start_cluster'] = test_df['start_cluster'].astype(str).astype(start_cluster_dtype)
-    
-    if not transition_data_frames:
-        logger.warning("Warning: No data available to calculate transition matrix. Using simpler imputation for month_6.")
-        month_6_idx_simple = test_df[test_df['month_num'] == 6].index
-        if not month_6_idx_simple.empty:
-            ids_for_month_6_simple = test_df.loc[month_6_idx_simple, 'id']
-            imputed_m6_simple = pd.Series(index=ids_for_month_6_simple.index, dtype=start_cluster_dtype) 
-            test_pivot_simple = test_df.pivot_table(index='id', columns='month_num', values='start_cluster', aggfunc='first')
-            if 5 in test_pivot_simple.columns:
-                map_val_5 = ids_for_month_6_simple.map(test_pivot_simple[5])
-                imputed_m6_simple = imputed_m6_simple.fillna(map_val_5.astype(start_cluster_dtype))
-            if 4 in test_pivot_simple.columns:
-                map_val_4 = ids_for_month_6_simple.map(test_pivot_simple[4])
-                imputed_m6_simple = imputed_m6_simple.fillna(map_val_4.astype(start_cluster_dtype))
-            if train_start_cluster_mode is not None:
-                imputed_m6_simple = imputed_m6_simple.fillna(train_start_cluster_mode)
-            test_df.loc[month_6_idx_simple, 'start_cluster'] = imputed_m6_simple.values
-    else:
-        all_transitions_df = pd.concat(transition_data_frames)
-        transition_counts = pd.crosstab(all_transitions_df['start_cluster'], all_transitions_df['next_month_start_cluster'])
-        transition_probabilities = transition_counts.apply(lambda x: x / x.sum() if x.sum() > 0 else 0, axis=1).fillna(0)
-        month_6_indices_to_fill = test_df[test_df['month_num'] == 6].index
-        for idx in month_6_indices_to_fill:
-            client_id = test_df.loc[idx, 'id']
-            imputed_value_for_client = np.nan 
-            sc_m5_series = test_df[(test_df['id'] == client_id) & (test_df['month_num'] == 5)]['start_cluster']
-            if not sc_m5_series.empty and pd.notna(sc_m5_series.iloc[0]):
-                sc_m5_actual = sc_m5_series.iloc[0]
-                if sc_m5_actual in transition_probabilities.index and transition_probabilities.loc[sc_m5_actual].sum() > 0:
-                    imputed_value_for_client = transition_probabilities.loc[sc_m5_actual].idxmax()
-            if pd.isna(imputed_value_for_client): 
-                sc_m4_series = test_df[(test_df['id'] == client_id) & (test_df['month_num'] == 4)]['start_cluster']
-                if not sc_m4_series.empty and pd.notna(sc_m4_series.iloc[0]):
-                    sc_m4_actual = sc_m4_series.iloc[0]
-                    if sc_m4_actual in transition_probabilities.index and transition_probabilities.loc[sc_m4_actual].sum() > 0:
-                        predicted_sc_m5_temp = transition_probabilities.loc[sc_m4_actual].idxmax()
-                        if predicted_sc_m5_temp in transition_probabilities.index and transition_probabilities.loc[predicted_sc_m5_temp].sum() > 0:
-                             imputed_value_for_client = transition_probabilities.loc[predicted_sc_m5_temp].idxmax()
-            if pd.isna(imputed_value_for_client) and train_start_cluster_mode is not None:
-                imputed_value_for_client = train_start_cluster_mode
-            test_df.loc[idx, 'start_cluster'] = imputed_value_for_client
-    
-    if train_start_cluster_mode is not None:
-        test_df.loc[test_df['month_num'] == 6, 'start_cluster'] = test_df.loc[test_df['month_num'] == 6, 'start_cluster'].fillna(train_start_cluster_mode)
-    test_df['start_cluster'] = test_df['start_cluster'].astype(str).astype(start_cluster_dtype) 
-    logger.info(f"Test df month_6 start_cluster NaNs after advanced imputation: {test_df[test_df['month_num'] == 6]['start_cluster'].isna().sum()}")
-    
-    
-    # --- 2.2. Combine train and test ---
+    train_df, test_df = parse_month_numbers(train_df_orig_loaded.copy(), test_df_orig_loaded.copy())
+    train_df, test_df, sc_dtype = impute_start_cluster(train_df, test_df)
     train_df['is_train'] = 1
     test_df['is_train'] = 0
-    full_df = pd.concat([train_df, test_df], ignore_index=True)
-    # Sort by id and month_num for consistent lag/rolling features
-    full_df = full_df.sort_values(['id', 'month_num']).reset_index(drop=True)
-    
-    # --- 2.3. Label Encode Target (Definition) ---
-    all_possible_clusters_str = sorted(list(set(train_df_orig_loaded['end_cluster'].astype(str).unique()) | set(str(c) for c in sample_submission_df.columns[1:])))
-    le_target.fit(all_possible_clusters_str)
-    num_classes = len(le_target.classes_)
-    logger.info(f"Number of target classes: {num_classes}")
-    
-    # --- 2.4. Feature Engineering (Lags, Diffs, Rolling) ---
-    logger.info("Starting extended feature engineering...")
-    cat_cols_original_names = [
-        "channel_code", "city", "city_type", "okved", "segment",
-        "start_cluster", "ogrn_month", "ogrn_year"
-    ]
-    final_cat_features_list = [] 
-    for col in cat_cols_original_names:
-        if col in full_df.columns:
-            full_df[col] = full_df[col].astype(str) 
-            if col == 'start_cluster':
-                full_df[col] = full_df[col].astype(start_cluster_dtype)
-            else:
-                unique_vals = full_df[col].dropna().unique()
-                cat_dtype = pd.CategoricalDtype(categories=unique_vals, ordered=False)
-                full_df[col] = full_df[col].astype(cat_dtype)
-            final_cat_features_list.append(col)
-    
-    num_cols_for_fe = [ # Renamed for clarity, as it's used for more than just lags now
-        'balance_amt_avg', 'balance_amt_max', 'balance_amt_min', 'balance_amt_day_avg',
-        'sum_cred_h_oper_3m', 'sum_deb_h_oper_3m', 'cnt_cred_h_oper_3m', 'cnt_deb_h_oper_3m',
-        # Add other numerical cols if you want to create rolling features for them
-    ]
-    numerical_cols = [] # This will store all generated numerical features
-    
-    for col in num_cols_for_fe:
-        if col in full_df.columns:
-            if not pd.api.types.is_numeric_dtype(full_df[col]): 
-                 try:
-                    full_df[col] = pd.to_numeric(full_df[col], errors='coerce') 
-                 except Exception as e: continue # Skip if cannot convert
-            
-            # Lag 1
-            full_df[f'{col}_lag1'] = full_df.groupby('id')[col].shift(1) # Keep NaNs for rolling, fill later
-            # Diff 1
-            full_df[f'{col}_diff1'] = full_df[col].fillna(0) - full_df[f'{col}_lag1'].fillna(0)
-            
-            # Rolling window features (e.g., over past 2 periods, including current)
-            # min_periods=1 ensures we get a value even if only 1 period is available
-            gb = full_df.groupby('id')[col]
-            full_df[f'{col}_roll_mean_2'] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).mean())
-            full_df[f'{col}_roll_std_2'] = gb.transform(lambda x: x.rolling(window=2, min_periods=1).std())
-            # full_df[f'{col}_roll_mean_3'] = gb.transform(lambda x: x.rolling(window=3, min_periods=1).mean())
-            # full_df[f'{col}_roll_std_3'] = gb.transform(lambda x: x.rolling(window=3, min_periods=1).std())
-    
-            if col not in numerical_cols: numerical_cols.append(col)
-            if f'{col}_lag1' not in numerical_cols: numerical_cols.append(f'{col}_lag1')
-            if f'{col}_diff1' not in numerical_cols: numerical_cols.append(f'{col}_diff1')
-            if f'{col}_roll_mean_2' not in numerical_cols: numerical_cols.append(f'{col}_roll_mean_2')
-            if f'{col}_roll_std_2' not in numerical_cols: numerical_cols.append(f'{col}_roll_std_2')
-            # if f'{col}_roll_mean_3' not in numerical_cols: numerical_cols.append(f'{col}_roll_mean_3')
-            # if f'{col}_roll_std_3' not in numerical_cols: numerical_cols.append(f'{col}_roll_std_3')
-    
-    # Fill NaNs that resulted from lags or rolling features (especially at the beginning of each group)
-    # These specific columns are now in numerical_cols list
-    for n_col in numerical_cols:
-        if n_col in full_df.columns and full_df[n_col].isnull().any():
-            if '_std_' in n_col: # Standard deviation can be 0 if constant
-                full_df[n_col] = full_df[n_col].fillna(0) 
-            else: # For means, lags, diffs, fill with 0 or a more sophisticated group-wise mean/median
-                full_df[n_col] = full_df[n_col].fillna(0)
-    
-    
-    if 'prev_month_start_cluster' in full_df.columns: # This should have been created before this loop by shift(1)
-        pass # It was already processed.
-    else: # Create if somehow missed
-        full_df['prev_month_start_cluster'] = full_df.groupby('id')['start_cluster'].shift(1)
-    
-    if 'prev_month_start_cluster' in full_df.columns: # Now process it
-        placeholder = "MISSING_LAG_SC"
-        existing_sc_categories = list(full_df['start_cluster'].dtype.categories) 
-        prev_month_categories = existing_sc_categories + [placeholder] if placeholder not in existing_sc_categories else existing_sc_categories
-        prev_start_cluster_dtype = pd.CategoricalDtype(categories=prev_month_categories, ordered=False)
-        
-        full_df['prev_month_start_cluster'] = full_df['prev_month_start_cluster'].astype(str).fillna(placeholder).astype(prev_start_cluster_dtype)
-        if 'prev_month_start_cluster' not in final_cat_features_list:
-            final_cat_features_list.append('prev_month_start_cluster')
-    logger.info("Extended feature engineering finished.")
-    
-    # --- Sections 3, 4, 5 (Data Splitting, Raw Feature Prep, Scaling/OHE) ---
-    # ... (These sections are kept identical to the previous working version, 
-    #      they will use the newly generated features in `numerical_cols` and `final_cat_features_list`) ...
-    # --- 3. Split back into Train and Test & Process Target ---
-    logger.info("\n--- 3. Splitting back and processing target... ---")
-    train_processed_df = full_df[full_df['is_train'] == 1].copy()
-    test_processed_df = full_df[full_df['is_train'] == 0].copy()
-    
-    if 'end_cluster' in train_processed_df.columns:
-        train_processed_df = train_processed_df.drop(columns=['end_cluster'])
-    
-    train_df_for_target_merge = date_to_numeric(train_df_orig_loaded.copy())[['id', 'month_num', 'end_cluster']]
-    train_processed_df = train_processed_df.merge(
-        train_df_for_target_merge,
-        on=['id', 'month_num'],
-        how='left'
-    )
-    
-    if 'end_cluster' not in train_processed_df.columns:
-        raise KeyError("Column 'end_cluster' is missing after merge. Check merge logic.")
-    
-    train_processed_df.dropna(subset=['end_cluster'], inplace=True)
-    train_processed_df['end_cluster_encoded'] = le_target.transform(train_processed_df['end_cluster'].astype(str))
-    train_processed_df['end_cluster_encoded'] = train_processed_df['end_cluster_encoded'].astype(int)
-    
-    features_to_drop = ['id', 'date', 'month_num', 'is_train', 'end_cluster', 'end_cluster_encoded',
-                        'index_city_code', 'ogrn_inn_connect_code'] 
-    
-    potential_features = [col for col in full_df.columns if col not in features_to_drop]
-    
-    numerical_features_final = [
-        col for col in numerical_cols 
-        if col in potential_features and col in train_processed_df.columns and pd.api.types.is_numeric_dtype(train_processed_df[col])
-    ]
-    categorical_features_final = [
-        col for col in final_cat_features_list
-        if col in potential_features and col in train_processed_df.columns and (pd.api.types.is_categorical_dtype(train_processed_df[col]) or pd.api.types.is_string_dtype(train_processed_df[col]) or pd.api.types.is_object_dtype(train_processed_df[col]))
-    ]
-    
-    logger.info(f"Final Numerical Features ({len(numerical_features_final)}): {numerical_features_final[:10]}...") # Print more
-    logger.info(f"Final Categorical Features ({len(categorical_features_final)}): {categorical_features_final[:5]}...")
-    
-    # --- 4. Validation Strategy (Time-based) ---
-    logger.info("\n--- 4. Creating train/validation split... ---")
-    train_val_df = train_processed_df[train_processed_df['month_num'].isin([1, 2])]
-    valid_df = train_processed_df[train_processed_df['month_num'] == 3]
-    
-    if train_val_df.empty: raise RuntimeError("Error: train_val_df is empty after month filtering.")
-    if valid_df.empty: raise RuntimeError("Error: valid_df is empty after month filtering.")
-    
-    X_train_val_raw = train_val_df[numerical_features_final + categorical_features_final].copy()
-    y_train_val_int = train_val_df['end_cluster_encoded'].copy()
-    X_valid_raw = valid_df[numerical_features_final + categorical_features_final].copy()
-    y_valid_int = valid_df['end_cluster_encoded'].copy()
-    
-    test_month_6_df = test_processed_df[test_processed_df['month_num'] == 6]
-    if test_month_6_df.empty:
-        logger.warning("Warning: test_month_6_df is empty. Predictions for test will be based on an empty structure.")
-        X_test_month_6_raw = pd.DataFrame(columns=numerical_features_final + categorical_features_final) 
-        ids_test_month_6 = pd.Series(dtype='object', name='id') 
-    else:
-        X_test_month_6_raw = test_month_6_df[numerical_features_final + categorical_features_final].copy()
-        ids_test_month_6 = test_month_6_df['id'].copy()
-    
-    logger.info(f"Raw X_train_val shape: {X_train_val_raw.shape}, y_train_val shape: {y_train_val_int.shape}")
-    logger.info(f"Raw X_valid shape: {X_valid_raw.shape}, y_valid shape: {y_valid_int.shape}")
-    logger.info(f"Raw X_test_month_6 shape: {X_test_month_6_raw.shape}, Test IDs shape: {ids_test_month_6.shape}")
-    
-    if X_train_val_raw.empty or X_valid_raw.empty: raise RuntimeError("Error: Raw train_val or valid set is empty.")
-    if y_train_val_int.empty or y_valid_int.empty: raise RuntimeError("Error: Target for train or validation is empty.")
-    
-    # --- 5. NN Specific Preprocessing (Scaling & One-Hot Encoding) ---
-    # ... (Identical to previous version, using MAX_OHE_CATEGORIES from top) ...
-    logger.info("\n--- 5. NN Specific Preprocessing (Scaling & One-Hot Encoding) ---")
-    scaler = StandardScaler()
-    logger.info("Scaling numerical features...")
-    if not X_train_val_raw[numerical_features_final].empty:
-        X_train_val_num_scaled = scaler.fit_transform(X_train_val_raw[numerical_features_final].fillna(0))
-    else: 
-        X_train_val_num_scaled = np.empty((len(X_train_val_raw), 0)) 
-    
-    if not X_valid_raw[numerical_features_final].empty:
-        X_valid_num_scaled = scaler.transform(X_valid_raw[numerical_features_final].fillna(0))
-    else:
-        X_valid_num_scaled = np.empty((len(X_valid_raw), 0))
-    
-    if not X_test_month_6_raw.empty and not X_test_month_6_raw[numerical_features_final].empty:
-        X_test_m6_num_scaled = scaler.transform(X_test_month_6_raw[numerical_features_final].fillna(0))
-    elif not X_test_month_6_raw.empty and X_test_month_6_raw[numerical_features_final].empty: 
-        X_test_m6_num_scaled = np.empty((len(X_test_month_6_raw), 0))
-    else: 
-        X_test_m6_num_scaled = np.empty((0, len(numerical_features_final) if numerical_features_final else 0))
-    
-    X_train_val_num_scaled_df = pd.DataFrame(X_train_val_num_scaled, columns=numerical_features_final, index=X_train_val_raw.index)
-    X_valid_num_scaled_df = pd.DataFrame(X_valid_num_scaled, columns=numerical_features_final, index=X_valid_raw.index)
-    X_test_m6_num_scaled_df = pd.DataFrame(X_test_m6_num_scaled, columns=numerical_features_final, index=X_test_month_6_raw.index if not X_test_month_6_raw.empty else None)
-    logger.info("Numerical features scaled.")
-    
-    logger.info("\nManaging cardinality and One-Hot Encoding categorical features...")
-    X_train_val_cat_mod = X_train_val_raw[categorical_features_final].astype(str).copy()
-    X_valid_cat_mod = X_valid_raw[categorical_features_final].astype(str).copy()
-    X_test_m6_cat_mod = X_test_month_6_raw[categorical_features_final].astype(str).copy() if not X_test_month_6_raw.empty else pd.DataFrame(columns=categorical_features_final, dtype=str)
-    
-    learned_top_categories = {}
-    for col in categorical_features_final:
-        n_unique_train = X_train_val_cat_mod[col].nunique()
-        logger.info(f"  Processing categorical column '{col}': {n_unique_train} unique values in training split.")
-        if n_unique_train > MAX_OHE_CATEGORIES:
-            top_n_minus_1 = MAX_OHE_CATEGORIES - 1
-            # print(f"    '{col}' has high cardinality ({n_unique_train}). Applying top-{top_n_minus_1} categories + an 'OTHER' category.")
-            top_cats = X_train_val_cat_mod[col].value_counts().nlargest(top_n_minus_1).index.tolist()
-            learned_top_categories[col] = top_cats
-            other_value_for_col = f'{col}_OTHER_RARE'
-            X_train_val_cat_mod[col] = X_train_val_cat_mod[col].apply(lambda x: x if x in top_cats else other_value_for_col)
-            X_valid_cat_mod[col] = X_valid_cat_mod[col].apply(lambda x: x if x in top_cats else other_value_for_col)
-            if not X_test_m6_cat_mod.empty:
-                 X_test_m6_cat_mod[col] = X_test_m6_cat_mod[col].apply(lambda x: x if x in top_cats else other_value_for_col)
-            # print(f"    '{col}' after capping: {X_train_val_cat_mod[col].nunique()} unique values (including OTHER).")
-        else:
-            learned_top_categories[col] = X_train_val_cat_mod[col].unique().tolist()
-            # print(f"    '{col}' has {n_unique_train} categories, no capping applied.")
-    
-    logger.info("\nApplying pd.get_dummies...")
-    X_train_val_cat_ohe = pd.get_dummies(X_train_val_cat_mod, dummy_na=False, dtype=np.uint8)
-    X_valid_cat_ohe_unaligned = pd.get_dummies(X_valid_cat_mod, dummy_na=False, dtype=np.uint8)
-    if not X_test_m6_cat_mod.empty:
-        X_test_m6_cat_ohe_unaligned = pd.get_dummies(X_test_m6_cat_mod, dummy_na=False, dtype=np.uint8)
-    else: 
-        X_test_m6_cat_ohe_unaligned = pd.DataFrame(dtype=np.uint8) 
-    logger.info("pd.get_dummies applied.")
-    
-    train_ohe_cols = X_train_val_cat_ohe.columns
-    logger.info(f"Number of OHE columns from training data after potential capping: {len(train_ohe_cols)}")
-    
-    logger.info("Reindexing OHE columns for validation and test sets...")
-    X_valid_cat_ohe = X_valid_cat_ohe_unaligned.reindex(columns=train_ohe_cols, fill_value=0).astype(np.uint8)
-    if not X_test_m6_cat_ohe_unaligned.empty:
-        X_test_m6_cat_ohe = X_test_m6_cat_ohe_unaligned.reindex(columns=train_ohe_cols, fill_value=0).astype(np.uint8)
-    else: 
-        X_test_m6_cat_ohe = pd.DataFrame(columns=train_ohe_cols, index=X_test_m6_num_scaled_df.index, dtype=np.uint8).fillna(0)
-    logger.info("OHE columns aligned.")
-    
-    logger.info("\nCombining numerical and categorical features...")
-    X_train_val_final = pd.concat([X_train_val_num_scaled_df, X_train_val_cat_ohe], axis=1)
-    X_valid_final = pd.concat([X_valid_num_scaled_df, X_valid_cat_ohe], axis=1)
-    X_test_m6_final = pd.concat([X_test_m6_num_scaled_df, X_test_m6_cat_ohe], axis=1)
-    logger.info("Final feature matrices created.")
-    
-    logger.info(f"X_train_val_final shape: {X_train_val_final.shape}")
-    logger.info(f"X_valid_final shape: {X_valid_final.shape}")
-    logger.info(f"X_test_m6_final shape: {X_test_m6_final.shape}")
-    
-    logger.info("\nOne-hot encoding target variable...")
-    y_train_val_ohe = to_categorical(y_train_val_int, num_classes=num_classes)
-    y_valid_ohe = to_categorical(y_valid_int, num_classes=num_classes)
-    logger.info("Target variable one-hot encoded.")
-    
-    if X_train_val_final.empty or X_valid_final.empty:
-        raise RuntimeError("Error: Training or validation set is empty after NN preprocessing.")
-    if y_train_val_int.empty or y_valid_int.empty:
-        raise RuntimeError("Error: Target for training or validation is empty.")
-    if X_train_val_final.shape[1] == 0 and len(X_train_val_final) > 0:
-        raise RuntimeError("Error: X_train_val_final has no columns but has rows!")
-    elif X_train_val_final.shape[1] == 0 and len(X_train_val_final) == 0:
-        logger.warning("Warning: X_train_val_final is completely empty.")
-        if not (len(y_train_val_int) == 0 and len(y_train_val_ohe) == 0):
-            raise RuntimeError("Error: X_train_val_final empty but y_train_val not.")
-
-    return X_train_val_final, y_train_val_int, y_train_val_ohe, X_valid_final, y_valid_int, y_valid_ohe, X_test_m6_final, ids_test_month_6, num_classes
-
+    full_df = pd.concat([train_df, test_df], ignore_index=True).sort_values(['id', 'month_num']).reset_index(drop=True)
+    full_df, _, _ = generate_features(full_df, sc_dtype)
+    return prepare_train_valid_test(full_df, sc_dtype, train_df_orig_loaded, sample_submission_df)
 
 def train_and_predict(X_train_val_final, y_train_val_ohe, X_valid_final, y_valid_ohe, y_valid_int, num_classes, cluster_weights_df, X_test_m6_final, ids_test_month_6, sample_submission_df):
     # --- 6. Build and Train Neural Network ---
@@ -610,6 +339,13 @@ def train_and_predict(X_train_val_final, y_train_val_ohe, X_valid_final, y_valid
 
 
 def main():
+    args = parse_args()
+    global L2_REG_LAMBDA, INITIAL_LR, BATCH_SIZE, MAX_EPOCHS
+    L2_REG_LAMBDA = args.l2
+    INITIAL_LR = args.lr
+    BATCH_SIZE = args.batch_size
+    MAX_EPOCHS = args.epochs
+
     data = load_data()
     (
         X_train_val_final,
