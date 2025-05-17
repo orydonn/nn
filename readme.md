@@ -13,6 +13,12 @@ Install the required dependencies with
 ```bash
 pip install -r requirements.txt
 ```
+If you plan to run the LightGBM-based script (`model_new.py`) on macOS,
+make sure the `libomp` runtime is installed as well:
+```bash
+brew install libomp
+```
+Without it LightGBM may fail to load with an error about `libomp.dylib`.
 
 ## Usage
 Run the training script with optional hyperparameters:
