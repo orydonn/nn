@@ -1,6 +1,11 @@
-pandas
-numpy
-scikit-learn
-tensorflow
+pandas~=2.2.3
+numpy~=2.1.3
+scikit-learn~=1.6.1
+tensorflow~=2.19.0
 openpyxl
+<<<<<<< Updated upstream
 lightgbm
+=======
+
+lightgbm~=4.6.0
+>>>>>>> Stashed changes
