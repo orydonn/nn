@@ -6,7 +6,7 @@ from sklearn.metrics import roc_auc_score
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization, LeakyReLU
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import ReduceLROnPlateau
 from tensorflow.keras import regularizers
 
 import logging
@@ -75,6 +75,40 @@ def weighted_roc_auc(y_true_int: np.ndarray, y_pred_proba: np.ndarray, weights_d
         return (classes_roc_auc[:min_len] * weights[:min_len]).sum() if min_len > 0 else 0.0
 
     return (classes_roc_auc * weights).sum()
+
+class WeightedRocAucEarlyStopping(tf.keras.callbacks.Callback):
+    """Early stopping based on weighted ROC-AUC metric."""
+
+    def __init__(self, validation_data, weights_dict, label_encoder, patience=20, min_delta=1e-4, verbose=1):
+        super().__init__()
+        self.validation_data = validation_data
+        self.weights_dict = weights_dict
+        self.label_encoder = label_encoder
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.best = -np.inf
+        self.wait = 0
+        self.best_weights = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        X_val, y_val_ohe, y_val_int = self.validation_data
+        y_pred = self.model.predict(X_val, verbose=0)
+        score = weighted_roc_auc(y_val_int, y_pred, self.weights_dict, self.label_encoder)
+        if logs is not None:
+            logs['val_weighted_auc'] = score
+        if score > self.best + self.min_delta:
+            self.best = score
+            self.wait = 0
+            self.best_weights = self.model.get_weights()
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                if self.verbose:
+                    print(f"WeightedRocAucEarlyStopping: stopping at epoch {epoch + 1} with best={self.best}")
+                self.model.stop_training = True
+                if self.best_weights is not None:
+                    self.model.set_weights(self.best_weights)
 
 # --- 2. Preprocessing and Feature Engineering ---
 def preprocess_data(train_df_orig_loaded, test_df_orig_loaded, cluster_weights_df, sample_submission_df):
@@ -487,21 +521,35 @@ def train_and_predict(X_train_val_final, y_train_val_ohe, X_valid_final, y_valid
         return model
     
     if X_train_val_final.shape[1] > 0: 
-        nn_model = create_nn_model(input_shape=X_train_val_final.shape[1], 
-                                   num_classes_out=num_classes, 
-                                   l2_lambda_val=L2_REG_LAMBDA) # Pass L2_REG_LAMBDA
+        nn_model = create_nn_model(input_shape=X_train_val_final.shape[1],
+                                   num_classes_out=num_classes,
+                                   l2_lambda_val=L2_REG_LAMBDA)
         nn_model.summary()
-    
-        early_stopping = EarlyStopping(monitor='val_auc_keras', mode='max', patience=20, restore_best_weights=True, verbose=1) # Increased patience
-        reduce_lr = ReduceLROnPlateau(monitor='val_auc_keras', mode='max', factor=0.2, patience=7, min_lr=0.000001, verbose=1) # Increased patience
-    
+
+        weights_for_metric = cluster_weights_df.set_index("cluster")["unnorm_weight"].to_dict()
+
+        train_sample_weights = np.array([
+            weights_for_metric.get(str(label), 1.0)
+            for label in le_target.inverse_transform(y_train_val_ohe.argmax(axis=1))
+        ])
+
+        w_auc_stop = WeightedRocAucEarlyStopping(
+            validation_data=(X_valid_final, y_valid_ohe, y_valid_int.values),
+            weights_dict=weights_for_metric,
+            label_encoder=le_target,
+            patience=20,
+            verbose=1,
+        )
+        reduce_lr = ReduceLROnPlateau(monitor='val_weighted_auc', mode='max', factor=0.2, patience=7, min_lr=0.000001, verbose=1)
+
         logger.info("\n--- Fitting the NN model (Wider First Layer, Tunable Params) ---")
         history = nn_model.fit(
             X_train_val_final, y_train_val_ohe,
             validation_data=(X_valid_final, y_valid_ohe),
-            epochs=MAX_EPOCHS, 
-            batch_size=BATCH_SIZE, 
-            callbacks=[early_stopping, reduce_lr], 
+            epochs=MAX_EPOCHS,
+            batch_size=BATCH_SIZE,
+            callbacks=[w_auc_stop, reduce_lr],
+            sample_weight=train_sample_weights,
             verbose=1
         )
         logger.info("\n--- NN Model training finished ---")
@@ -510,7 +558,6 @@ def train_and_predict(X_train_val_final, y_train_val_ohe, X_valid_final, y_valid
         # ... (This section is kept identical to the previous working version) ...
         logger.info("\n--- 7. Evaluating and Predicting ---")
         y_valid_proba_nn = nn_model.predict(X_valid_final)
-        weights_for_metric = cluster_weights_df.set_index("cluster")["unnorm_weight"].to_dict()
         valid_roc_auc_nn = weighted_roc_auc(y_valid_int.values, y_valid_proba_nn, weights_for_metric, le_target)
         logger.info(f"NN Validation Weighted ROC AUC: {valid_roc_auc_nn}")
     
