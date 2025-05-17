@@ -76,7 +76,6 @@ def weighted_roc_auc(y_true_int: np.ndarray, y_pred_proba: np.ndarray, weights_d
 
     return (classes_roc_auc * weights).sum()
 
-
 class WeightedRocAucEarlyStopping(tf.keras.callbacks.Callback):
     """Early stopping based on weighted ROC-AUC metric."""
 
