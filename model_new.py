@@ -52,6 +52,39 @@ def cap_rare_categories(df, cat_cols):
     return df
 
 
+def impute_start_cluster(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    """Fill missing start_cluster for month 6 in test using previous months."""
+    for df in (train_df, test_df):
+        if 'month_num' not in df.columns:
+            df['month_num'] = df['date'].str.replace('month_', '').astype(int)
+
+    all_cats = pd.concat([
+        train_df['start_cluster'],
+        test_df['start_cluster']
+    ]).dropna().astype(str).unique()
+    dtype = pd.CategoricalDtype(categories=all_cats, ordered=False)
+    train_df['start_cluster'] = train_df['start_cluster'].astype(str).astype(dtype)
+    test_df['start_cluster'] = test_df['start_cluster'].astype(str).astype(dtype)
+
+    mode_val = train_df['start_cluster'].mode()
+    mode_val = mode_val.iloc[0] if not mode_val.empty else (
+        all_cats[0] if len(all_cats) else 'unknown'
+    )
+
+    pivot = test_df.pivot_table(
+        index='id', columns='month_num', values='start_cluster', aggfunc='first'
+    )
+    idx_m6 = test_df[test_df['month_num'] == 6].index
+    if len(idx_m6) > 0:
+        ids = test_df.loc[idx_m6, 'id']
+        val = pivot.reindex(ids).get(5)
+        fallback = pivot.reindex(ids).get(4)
+        val = val.fillna(fallback).fillna(mode_val)
+        test_df.loc[idx_m6, 'start_cluster'] = val.values.astype(str)
+
+    return train_df, test_df, dtype
+
+
 def preprocess(train_df, test_df, num_cols, cat_cols):
     full = pd.concat([train_df, test_df], keys=['train', 'test'])
     full = cap_rare_categories(full, cat_cols)
@@ -72,6 +105,9 @@ def main():
     num_cols, cat_cols = load_feature_lists()
     logger.info(f'Numeric features: {len(num_cols)}, Categorical features: {len(cat_cols)}')
     print(f'Parsed feature lists. Numeric: {len(num_cols)}; Categorical: {len(cat_cols)}')
+
+    # Ensure start_cluster is filled for month 6 rows in test
+    train_df, test_df, _ = impute_start_cluster(train_df, test_df)
 
     le = LabelEncoder()
     le.fit(train_df['end_cluster'].astype(str))
